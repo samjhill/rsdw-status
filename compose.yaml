@@ -1,0 +1,20 @@
+# Set RSDW_DATA_DIR to the host path mounted as /home/steam/rsdw-dedicated
+# in the game container. This page does not start the game server.
+services:
+  status:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    command: ["python", "-u", "/app/server.py"]
+    ports:
+      - "127.0.0.1:8791:8791"
+    environment:
+      RSDW_CONTAINER: rsdw-dedicated
+      RSDW_STATUS_PORT: "8791"
+      RSDW_DIRECT_HOST: ""
+      RSDW_GAME_PORT: "7777"
+    volumes:
+      - ./server.py:/app/server.py:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${RSDW_DATA_DIR}/RSDragonwilds/Saved/Logs:/logs:ro
+      - ${RSDW_DATA_DIR}/RSDragonwilds/Saved/Config/LinuxServer:/config:ro
