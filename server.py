@@ -18,7 +18,13 @@ INI = Path("/config/DedicatedServer.ini")
 PORT = int(os.environ.get("RSDW_STATUS_PORT", "8791"))
 DIRECT_HOST = os.environ.get("RSDW_DIRECT_HOST", "").strip()
 GAME_PORT = int(os.environ.get("RSDW_GAME_PORT", "7777"))
-CODE_RE = re.compile(r'JoinCode"\] written with key\[[^\]]+\] value\[([A-Z0-9-]+)\]')
+STAMP = r"\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}):\d{3}\]"
+SAVE_RE = re.compile(STAMP + r".*Save completed SUCCESSFULLY")
+READY_RE = re.compile(STAMP + r'.*ReadyToJoin"\] written with key\[[^\]]+\] value\[([01])\]')
+ACCEPT_RE = re.compile(STAMP + r".*NotifyAcceptingConnection accepted from: (\S+)")
+CLOSE_RE = re.compile(STAMP + r".*ControlChannelClose")
+JOIN_RE = re.compile(STAMP + r'.*JoinCode"\] written with key\[[^\]]+\] value\[([A-Z0-9-]+)\]')
+STALE_AFTER = 600
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -50,7 +56,10 @@ PAGE = """<!doctype html>
   }
   button.secondary { background: transparent; color: #1c1915; box-shadow: inset 0 0 0 1px #1c1915; }
   button:disabled { opacity: 0.45; cursor: default; }
-  .meta { margin-top: 1.6rem; color: #6d645b; line-height: 1.55; }
+  .code.not-ready { opacity: 0.45; }
+  .facts { margin: 1.4rem 0 0; padding: 0; list-style: none; color: #6d645b; line-height: 1.55; }
+  .facts .warn { color: #a33b32; }
+  .meta { margin-top: 1rem; color: #6d645b; line-height: 1.55; }
   .err { color: #a33b32; }
 </style>
 </head>
@@ -63,6 +72,7 @@ PAGE = """<!doctype html>
     <button id="copy" type="button" disabled>Copy invite code</button>
     <button id="copy-password" class="secondary" type="button" disabled>Copy password</button>
   </div>
+  <ul class="facts" id="facts"></ul>
   <p class="meta" id="meta"></p>
 </main>
 <script>
@@ -72,6 +82,7 @@ const labelEl = document.getElementById("label");
 const stateEl = document.getElementById("state");
 const copyEl = document.getElementById("copy");
 const copyPasswordEl = document.getElementById("copy-password");
+const factsEl = document.getElementById("facts");
 const metaEl = document.getElementById("meta");
 let code = "";
 let joinPassword = "";
@@ -83,6 +94,19 @@ function uptime(seconds) {
   if (h) return h + "h " + m + "m";
   if (m) return m + "m";
   return seconds + "s";
+}
+
+function ago(seconds) {
+  if (seconds == null) return "";
+  if (seconds < 45) return "just now";
+  return uptime(seconds) + " ago";
+}
+
+function addFact(text, warn) {
+  const item = document.createElement("li");
+  item.textContent = text;
+  if (warn) item.className = "warn";
+  factsEl.appendChild(item);
 }
 
 async function refresh() {
@@ -98,9 +122,24 @@ async function refresh() {
     code = data.invite_code || "";
     joinPassword = data.join_password || "";
     codeEl.textContent = code || "No code yet";
-    copyEl.disabled = !code;
+    codeEl.classList.toggle("not-ready", up && data.ready_to_join === false);
+    copyEl.disabled = !code || (up && data.ready_to_join === false);
     copyPasswordEl.disabled = !joinPassword;
     copyPasswordEl.textContent = joinPassword ? "Copy password" : "No password";
+    factsEl.replaceChildren();
+    if (up && data.ready_to_join === false) addFact("Not ready to join yet.", true);
+    if (data.save_age_seconds == null) {
+      addFact("No successful save in the recent log.", !!(up && data.save_stale));
+    } else {
+      addFact("Saved " + ago(data.save_age_seconds) + ".", false);
+    }
+    if (data.save_stale && data.save_age_seconds != null) addFact("The last save is more than 10 minutes old.", true);
+    if (data.last_accept) {
+      addFact("Last connection " + ago(data.last_accept.age_seconds) + " from " + data.last_accept.address + ".", false);
+    } else {
+      addFact("No connection has reached this server.", false);
+    }
+    if (data.last_close_age_seconds != null) addFact("Last close " + ago(data.last_close_age_seconds) + ".", false);
     const bits = [joinPassword ? "Join password is " + joinPassword + "." : "No join password."];
     if (!up && code) bits.unshift("That code is from the last run. It changes when the server starts.");
     if (data.direct) bits.push("Direct connect " + data.direct + ", UDP " + data.port + ".");
@@ -194,12 +233,59 @@ def container_state():
     }
 
 
-def invite_code():
+def log_stamp(value):
+    return datetime.strptime(value, "%Y.%m.%d-%H.%M.%S").replace(tzinfo=timezone.utc)
+
+
+def age_seconds(stamp, now):
+    return max(0, int((now - log_stamp(stamp)).total_seconds()))
+
+
+def read_log():
     if not LOG.exists():
-        return None
-    data = LOG.read_bytes()[-262144:].decode("utf-8", "replace")
-    found = CODE_RE.findall(data)
+        return ""
+    size = LOG.stat().st_size
+    with LOG.open("rb") as handle:
+        if size <= 4_000_000:
+            data = handle.read()
+        else:
+            head = handle.read(1_000_000)
+            handle.seek(size - 2_000_000)
+            data = head + b"\n" + handle.read()
+    return data.decode("utf-8", "replace")
+
+
+def last_match(pattern, text):
+    found = list(pattern.finditer(text))
     return found[-1] if found else None
+
+
+def log_facts(text, running, uptime_seconds, now=None):
+    now = now or datetime.now(timezone.utc)
+    save = last_match(SAVE_RE, text)
+    ready = last_match(READY_RE, text)
+    accept = last_match(ACCEPT_RE, text)
+    close = last_match(CLOSE_RE, text)
+    code = last_match(JOIN_RE, text)
+    save_age = age_seconds(save.group(1), now) if save else None
+    ready_to_join = None if ready is None else ready.group(2) == "1"
+    save_stale = bool(
+        running
+        and (
+            (save_age is not None and save_age > STALE_AFTER)
+            or (save_age is None and uptime_seconds is not None and uptime_seconds > STALE_AFTER)
+        )
+    )
+    return {
+        "invite_code": code.group(2) if code else None,
+        "ready_to_join": ready_to_join,
+        "save_age_seconds": save_age,
+        "save_stale": save_stale,
+        "last_accept": None
+        if accept is None
+        else {"age_seconds": age_seconds(accept.group(1), now), "address": accept.group(2)},
+        "last_close_age_seconds": None if close is None else age_seconds(close.group(1), now),
+    }
 
 
 def snapshot():
@@ -207,12 +293,18 @@ def snapshot():
         state = container_state()
     except Exception:
         state = {"running": False, "status": "unknown", "uptime_seconds": None}
+    facts = log_facts(read_log(), state["running"], state["uptime_seconds"])
     return {
         "name": ini_value("ServerName") or "Dragonwilds",
         "running": state["running"],
         "status": state["status"],
         "uptime_seconds": state["uptime_seconds"],
-        "invite_code": invite_code(),
+        "invite_code": facts["invite_code"],
+        "ready_to_join": facts["ready_to_join"],
+        "save_age_seconds": facts["save_age_seconds"],
+        "save_stale": facts["save_stale"],
+        "last_accept": facts["last_accept"],
+        "last_close_age_seconds": facts["last_close_age_seconds"],
         "join_password": ini_value("WorldPassword"),
         "direct": DIRECT_HOST,
         "port": GAME_PORT,

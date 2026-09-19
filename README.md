@@ -22,7 +22,9 @@ Open [http://127.0.0.1:8791](http://127.0.0.1:8791).
 ## What you see
 
 - A green or red dot, and how long the container has been up.
-- The invite code, large, with a copy button. It is the latest `JoinCode` line in `RSDragonwilds.log`. A new code is written every time the game server starts. That log line is not a stable API.
+- The invite code, large, with a copy button. It is the latest `JoinCode` line in `RSDragonwilds.log`. A new code is written every time the game server starts. The copy button stays off until the log says the session is ready to join.
+- How long ago the world last saved. The dedicated server saves about every five minutes. If it is up and the last success is older than 10 minutes, the page says the save looks stale.
+- The last address that reached the server, and the last time a connection closed. The log has no player names, so this is not a player list.
 - The join password from `WorldPassword` in `DedicatedServer.ini`, with a copy button. If the world has no password, the button stays off.
 - The page title, from `ServerName` in that same file.
 
