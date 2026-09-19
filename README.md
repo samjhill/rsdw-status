@@ -1,48 +1,55 @@
 # rsdw-status
 
-A small page for an [rsdw-dedicated](https://github.com/runescape/rsdw-dedicated) server. It shows whether the container is running, the current invite code, and the join password.
+See whether a [RuneScape: Dragonwilds dedicated server](https://github.com/runescape/rsdw-dedicated) is up, and copy the current invite code, without opening the game.
 
-This is not a Jagex project. It is not part of the official image.
+> [!NOTE]
+> Unofficial. This is not a Jagex project, and it is not part of the official image.
 
-## What it shows
+## Start
 
-- Up or down, and how long the container has been up.
-- The invite code from the latest `JoinCode` line in `RSDragonwilds.log`. That code changes every time the game server starts. The log line is not a stable API.
-- The join password from `WorldPassword` in `DedicatedServer.ini`.
-- The server name from `ServerName` in that same file.
+The game server has to be running in Docker already.
 
-It does not show the admin password. The ini file still contains it, and this container can read that file.
-
-## Run
-
-The game server has to be running under Docker already. Point `RSDW_DATA_DIR` at the host directory mounted as `/home/steam/rsdw-dedicated` in that container.
+1. Set `RSDW_DATA_DIR` to the host folder that the game container mounts at `/home/steam/rsdw-dedicated`.
+2. Start this page.
 
 ```bash
 export RSDW_DATA_DIR=/path/to/rsdw-dedicated
 docker compose up -d
 ```
 
-Open http://127.0.0.1:8791
+Open [http://127.0.0.1:8791](http://127.0.0.1:8791).
 
-By default the page listens only on localhost. To open it from another computer on your network, change the publish line in `compose.yaml` to that machine's LAN address. Do not forward the port on your router. Anyone who can open the page can see the invite code and the join password.
+## What you see
 
-`/var/run/docker.sock` lets this container control Docker, not only read one container. Keep the page on a machine you trust.
+- A green or red dot, and how long the container has been up.
+- The invite code, large, with a copy button. It is the latest `JoinCode` line in `RSDragonwilds.log`. A new code is written every time the game server starts. That log line is not a stable API.
+- The join password from `WorldPassword` in `DedicatedServer.ini`, with a copy button. If the world has no password, the button stays off.
+- The page title, from `ServerName` in that same file.
+
+Set `RSDW_DIRECT_HOST` if you also want a direct-connect address on the page. Leave it empty and that line is omitted.
+
+## Keep it on your network
+
+> [!WARNING]
+> Anyone who can open this page can see the invite code and the join password. It listens on localhost only. If you change `compose.yaml` so other computers on your LAN can open it, do not forward that port on your router.
+
+The container mounts the Docker socket, so it can control Docker, not only read one container. Run it on a machine you trust.
+
+`DedicatedServer.ini` also contains the admin password. This page does not show it.
 
 ## Settings
 
-| Variable | Default | Purpose |
+| Variable | Default | What it does |
 | --- | --- | --- |
-| `RSDW_CONTAINER` | `rsdw-dedicated` | Container name to inspect |
-| `RSDW_STATUS_PORT` | `8791` | Port inside the status container. Match the published port. |
-| `RSDW_DIRECT_HOST` | empty | Shown as a direct-connect address. Omitted when empty. |
+| `RSDW_DATA_DIR` | | Host path of the game data. Compose only. Required. |
+| `RSDW_CONTAINER` | `rsdw-dedicated` | Container to inspect |
+| `RSDW_STATUS_PORT` | `8791` | Port the page binds inside the container. Keep it the same as the published port. |
+| `RSDW_DIRECT_HOST` | empty | Direct-connect address. Hidden when empty. |
 | `RSDW_GAME_PORT` | `7777` | Game port shown next to that address |
-| `RSDW_DATA_DIR` | | Host path of the game server data, used by Compose only |
 
-The log is read from `/logs/RSDragonwilds.log` and the ini from `/config/DedicatedServer.ini`. Those are the mount points in `compose.yaml`.
+Compose mounts the game log at `/logs/RSDragonwilds.log` and the ini at `/config/DedicatedServer.ini`.
 
-## Without this page
-
-The invite code is also in the game container's output:
+## Just the invite code
 
 ```bash
 docker logs rsdw-dedicated 2>&1 | awk '/JoinCode/{line=$0} END{print line}'
