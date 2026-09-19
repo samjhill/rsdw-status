@@ -57,3 +57,7 @@ Compose mounts the game log at `/logs/RSDragonwilds.log` and the ini at `/config
 ```bash
 docker logs rsdw-dedicated 2>&1 | awk '/JoinCode/{line=$0} END{print line}'
 ```
+
+## Record a session
+
+`watch-logs.py` polls the game log, container output, save-file sizes, and UDP ports every 30 seconds. It does not change the server. It skips profanity-filter lines. Set `RSDW_SSH_HOST`, `RSDW_LOG`, and `RSDW_SAV_DIR` before running it. Output stays in this directory and is gitignored.

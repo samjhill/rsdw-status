@@ -2,3 +2,10 @@
 secrets.env
 __pycache__/
 *.pyc
+.log-offset
+.docker-since
+events.log
+gamelog.log
+docker.log
+status.jsonl
+resources.log
