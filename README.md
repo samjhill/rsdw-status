@@ -1,5 +1,7 @@
 # rsdw-status
 
+<img src="docs/status.png" alt="Status page for a server named Ashvale, up for 2 hours, with invite code K7NP-4QXM." width="420">
+
 See whether a [RuneScape: Dragonwilds dedicated server](https://github.com/runescape/rsdw-dedicated) is up, and copy the current invite code, without opening the game.
 
 > [!NOTE]
