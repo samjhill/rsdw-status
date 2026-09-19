@@ -23,8 +23,9 @@ Open [http://127.0.0.1:8791](http://127.0.0.1:8791).
 
 - A green or red dot, and how long the container has been up.
 - The invite code, large, with a copy button. It is the latest `JoinCode` line in `RSDragonwilds.log`. A new code is written every time the game server starts. The copy button stays off until the log says the session is ready to join.
-- How long ago the world last saved. The dedicated server saves about every five minutes. If it is up and the last success is older than 10 minutes, the page says the save looks stale.
-- The last address that reached the server, and the last time a connection closed. If this start has none, the page uses the previous log and says it was before this start. The log has no player names, so this is not a player list.
+- How long ago the world last saved. The dedicated server saves about every five minutes. If `SaveGames` is mounted, the page also shows the save-file size, and says if that size has not changed for 10 minutes. If the server is up and the last success is older than 10 minutes, the page says the save looks stale.
+- Who is in, from `Join succeeded` lines, with the platform from the login line. A close names the player when the log includes the same account id as the login. If it does not, and more than one person was in, the page keeps them listed and says someone left without a name. It also shows how long ago the last close was. If this start has no close, the page uses the previous log and says that close was before this start.
+- Memory and CPU for the game container. Network totals are omitted; on a host-network server Docker reports those as zero.
 - A warning when the container log says a new Steam version is available and the server is stopping. That restart writes a new invite code.
 - The join password from `WorldPassword` in `DedicatedServer.ini`, with a copy button. If the world has no password, the button stays off.
 - The page title, from `ServerName` in that same file.
@@ -50,7 +51,7 @@ The container mounts the Docker socket, so it can control Docker, not only read 
 | `RSDW_DIRECT_HOST` | empty | Direct-connect address. Hidden when empty. |
 | `RSDW_GAME_PORT` | `7777` | Game port shown next to that address |
 
-Compose mounts the game log at `/logs/RSDragonwilds.log` and the ini at `/config/DedicatedServer.ini`.
+Compose mounts the game log at `/logs/RSDragonwilds.log`, the save files at `/saves`, and the ini at `/config/DedicatedServer.ini`. The save mount is optional. If it is missing, the page omits the file size.
 
 ## Just the invite code
 

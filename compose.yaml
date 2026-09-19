@@ -17,4 +17,5 @@ services:
       - ./server.py:/app/server.py:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ${RSDW_DATA_DIR}/RSDragonwilds/Saved/Logs:/logs:ro
+      - ${RSDW_DATA_DIR}/RSDragonwilds/Saved/SaveGames:/saves:ro
       - ${RSDW_DATA_DIR}/RSDragonwilds/Saved/Config/LinuxServer:/config:ro

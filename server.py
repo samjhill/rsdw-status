@@ -25,6 +25,13 @@ READY_RE = re.compile(STAMP + r'.*ReadyToJoin"\] written with key\[[^\]]+\] valu
 ACCEPT_RE = re.compile(STAMP + r".*NotifyAcceptingConnection accepted from: (\S+)")
 CLOSE_RE = re.compile(STAMP + r".*ControlChannelClose")
 JOIN_RE = re.compile(STAMP + r'.*JoinCode"\] written with key\[[^\]]+\] value\[([A-Z0-9-]+)\]')
+JOINED_RE = re.compile(r"Join succeeded:\s*(\S+)")
+LOGIN_NAME_RE = re.compile(r"Name=([^\s?]+)")
+LOGIN_PF_RE = re.compile(r"pf=([^?&\s]+)")
+USER_ID_RE = re.compile(r"userId:\s*(\S+)")
+UNIQUE_ID_RE = re.compile(r"UniqueId:\s*([^,\s]+)")
+CONN_CLOSE_RE = re.compile(STAMP + r".*UNetConnection::Close:")
+SAVES = Path(os.environ.get("RSDW_SAVES", "/saves"))
 STALE_AFTER = 600
 
 PAGE = """<!doctype html>
@@ -133,15 +140,26 @@ async function refresh() {
     if (data.save_age_seconds == null) {
       addFact("No successful save in the recent log.", !!(up && data.save_stale));
     } else {
-      addFact("Saved " + ago(data.save_age_seconds) + ".", false);
+      const size = data.save_bytes != null ? ", file " + data.save_bytes + " bytes" : "";
+      addFact("Saved " + ago(data.save_age_seconds) + size + ".", false);
     }
     if (data.save_stale && data.save_age_seconds != null) addFact("The last save is more than 10 minutes old.", true);
+    if (data.save_size_stale) addFact("Save file size has not changed for more than 10 minutes.", true);
+    if (data.usage) addFact("Memory " + data.usage.memory + ", CPU " + data.usage.cpu + ".", false);
     const prior = data.connection_before_this_start ? "before this start, " : "";
-    if (data.last_accept) {
-      addFact("Last connection " + prior + ago(data.last_accept.age_seconds) + " from " + data.last_accept.address + ".", false);
-    } else if (!data.connection_before_this_start) {
+    const players = data.players || [];
+    if (players.length) {
+      const names = players.map(player => player.platform ? player.name + " (" + player.platform + ")" : player.name);
+      let who = names[0];
+      if (names.length === 2) who = names[0] + " and " + names[1];
+      else if (names.length > 2) who = names.slice(0, -1).join(", ") + ", and " + names[names.length - 1];
+      addFact(who + (names.length === 1 ? " is in." : " are in."), false);
+    } else if (!data.connection_before_this_start && data.last_close_age_seconds == null) {
       addFact("No connection has reached this server.", false);
+    } else {
+      addFact("Nobody is in.", false);
     }
+    if (data.unnamed_leave) addFact("Someone left, and the log did not say who.", false);
     if (data.last_close_age_seconds != null) addFact("Last close " + prior + ago(data.last_close_age_seconds) + ".", false);
     const bits = [joinPassword ? "Join password is " + joinPassword + "." : "No join password."];
     if (!up && code) bits.unshift("That code is from the last run. It changes when the server starts.");
@@ -183,9 +201,9 @@ setInterval(refresh, 8000);
 """
 
 
-def docker_get(path):
+def docker_get(path, timeout=3):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(3)
+    sock.settimeout(timeout)
     try:
         sock.connect("/var/run/docker.sock")
         sock.sendall(f"GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode())
@@ -260,6 +278,71 @@ def read_log():
     if not LOG.exists():
         return ""
     return read_file(LOG)
+
+
+def mark_left(players, user_id):
+    for player in reversed(players):
+        if not player["left"] and player["user_id"] == user_id:
+            player["left"] = True
+            return True
+    return False
+
+
+def players_from_lines(lines):
+    players = []
+    platforms = {}
+    ids = {}
+    unnamed_leave = False
+    last_close = None
+    named_close_at = set()
+    for line in lines:
+        if "Login request:" in line:
+            name = LOGIN_NAME_RE.search(line)
+            platform = LOGIN_PF_RE.search(line)
+            user_id = USER_ID_RE.search(line)
+            if name and platform:
+                platforms[name.group(1)] = platform.group(1)
+            if name and user_id:
+                ids[name.group(1)] = user_id.group(1)
+            continue
+        joined = JOINED_RE.search(line)
+        if joined:
+            name = joined.group(1)
+            players.append({
+                "name": name,
+                "platform": platforms.get(name) or "",
+                "user_id": ids.get(name) or "",
+                "left": False,
+            })
+            continue
+        named = CONN_CLOSE_RE.search(line)
+        if named and "UniqueId:" in line:
+            last_close = named.group(1)
+            named_close_at.add(last_close)
+            user_id = UNIQUE_ID_RE.search(line)
+            if not (user_id and mark_left(players, user_id.group(1))):
+                unnamed_leave = True
+            continue
+        closed = CLOSE_RE.search(line)
+        if not closed:
+            continue
+        last_close = closed.group(1)
+        if last_close in named_close_at:
+            continue
+        still_in = [player for player in players if not player["left"]]
+        if len(still_in) == 1:
+            still_in[0]["left"] = True
+        elif len(still_in) > 1:
+            unnamed_leave = True
+    present = [{"name": player["name"], "platform": player["platform"]} for player in players if not player["left"]]
+    return present, unnamed_leave, last_close
+
+
+def players_in_log(path):
+    if not path.exists():
+        return [], False, None
+    with path.open("r", errors="replace") as handle:
+        return players_from_lines(handle)
 
 
 def newest_backup():
@@ -368,6 +451,85 @@ def steam_update_pending():
     return pending
 
 
+def current_save():
+    if not SAVES.is_dir():
+        return None
+    files = [path for path in SAVES.iterdir() if path.is_file() and path.suffix == ".sav"]
+    if not files:
+        return None
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+_save_seen = {"size": None, "changed": None}
+
+
+def save_file_facts(running, now):
+    path = current_save()
+    if path is None:
+        return None, False
+    stat = path.stat()
+    size = stat.st_size
+    mtime = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+    if _save_seen["size"] != size:
+        _save_seen["changed"] = mtime if _save_seen["changed"] is None else now
+        _save_seen["size"] = size
+    changed = _save_seen["changed"] or mtime
+    stale = bool(running and (now - changed).total_seconds() > STALE_AFTER)
+    return size, stale
+
+
+def format_mem(amount):
+    gib = 1024 ** 3
+    if amount >= gib:
+        text = f"{amount / gib:.2f}".rstrip("0").rstrip(".")
+        return f"{text} GiB"
+    return f"{round(amount / (1024 ** 2))} MiB"
+
+
+def memory_used(memory_stats):
+    usage = int(memory_stats.get("usage") or 0)
+    inner = memory_stats.get("stats") or {}
+    cache = inner.get("inactive_file")
+    if cache is None:
+        cache = inner.get("total_inactive_file") or 0
+    return max(0, usage - int(cache))
+
+
+def cpu_percent(stats):
+    cpu = stats.get("cpu_stats") or {}
+    previous = stats.get("precpu_stats") or {}
+    used = int((cpu.get("cpu_usage") or {}).get("total_usage") or 0)
+    used -= int((previous.get("cpu_usage") or {}).get("total_usage") or 0)
+    system = int(cpu.get("system_cpu_usage") or 0) - int(previous.get("system_cpu_usage") or 0)
+    if used <= 0 or system <= 0:
+        return None
+    cores = cpu.get("online_cpus") or len((cpu.get("cpu_usage") or {}).get("percpu_usage") or []) or 1
+    return round(used / system * int(cores) * 100)
+
+
+_usage_cache = {"at": 0.0, "value": None}
+
+
+def container_usage():
+    now = time.time()
+    if now - _usage_cache["at"] < 30:
+        return _usage_cache["value"]
+    try:
+        status, body = docker_get(f"/containers/{CONTAINER}/stats?stream=0", timeout=8)
+        if status == 200:
+            stats = json.loads(body)
+            memory = stats.get("memory_stats") or {}
+            used = memory_used(memory)
+            limit = int(memory.get("limit") or 0)
+            cpu = cpu_percent(stats)
+            if used and limit and cpu is not None:
+                _usage_cache["value"] = {"memory": f"{format_mem(used)} of {format_mem(limit)}", "cpu": f"{cpu}%"}
+    except Exception:
+        pass
+    _usage_cache["at"] = now
+    return _usage_cache["value"]
+
+
 def snapshot():
     try:
         state = container_state()
@@ -377,6 +539,16 @@ def snapshot():
     text = read_log()
     facts = log_facts(text, state["running"], state["uptime_seconds"], now)
     facts.update(connection_facts(text, now))
+    present, unnamed_leave, last_close = players_in_log(LOG)
+    facts["players"] = present
+    facts["unnamed_leave"] = unnamed_leave
+    if last_close:
+        facts["last_close_age_seconds"] = age_seconds(last_close, now)
+    save_bytes, save_size_stale = save_file_facts(state["running"], now)
+    try:
+        usage = container_usage() if state["running"] else None
+    except Exception:
+        usage = None
     try:
         update_pending = steam_update_pending()
     except Exception:
@@ -390,7 +562,12 @@ def snapshot():
         "ready_to_join": facts["ready_to_join"],
         "save_age_seconds": facts["save_age_seconds"],
         "save_stale": facts["save_stale"],
+        "save_bytes": save_bytes,
+        "save_size_stale": save_size_stale,
+        "usage": usage,
         "last_accept": facts["last_accept"],
+        "players": facts["players"],
+        "unnamed_leave": facts["unnamed_leave"],
         "last_close_age_seconds": facts["last_close_age_seconds"],
         "connection_before_this_start": facts["connection_before_this_start"],
         "update_pending": update_pending,
