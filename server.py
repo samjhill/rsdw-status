@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -128,18 +129,20 @@ async function refresh() {
     copyPasswordEl.textContent = joinPassword ? "Copy password" : "No password";
     factsEl.replaceChildren();
     if (up && data.ready_to_join === false) addFact("Not ready to join yet.", true);
+    if (data.update_pending) addFact("A Steam update will restart the server.", true);
     if (data.save_age_seconds == null) {
       addFact("No successful save in the recent log.", !!(up && data.save_stale));
     } else {
       addFact("Saved " + ago(data.save_age_seconds) + ".", false);
     }
     if (data.save_stale && data.save_age_seconds != null) addFact("The last save is more than 10 minutes old.", true);
+    const prior = data.connection_before_this_start ? "before this start, " : "";
     if (data.last_accept) {
-      addFact("Last connection " + ago(data.last_accept.age_seconds) + " from " + data.last_accept.address + ".", false);
-    } else {
+      addFact("Last connection " + prior + ago(data.last_accept.age_seconds) + " from " + data.last_accept.address + ".", false);
+    } else if (!data.connection_before_this_start) {
       addFact("No connection has reached this server.", false);
     }
-    if (data.last_close_age_seconds != null) addFact("Last close " + ago(data.last_close_age_seconds) + ".", false);
+    if (data.last_close_age_seconds != null) addFact("Last close " + prior + ago(data.last_close_age_seconds) + ".", false);
     const bits = [joinPassword ? "Join password is " + joinPassword + "." : "No join password."];
     if (!up && code) bits.unshift("That code is from the last run. It changes when the server starts.");
     if (data.direct) bits.push("Direct connect " + data.direct + ", UDP " + data.port + ".");
@@ -241,11 +244,9 @@ def age_seconds(stamp, now):
     return max(0, int((now - log_stamp(stamp)).total_seconds()))
 
 
-def read_log():
-    if not LOG.exists():
-        return ""
-    size = LOG.stat().st_size
-    with LOG.open("rb") as handle:
+def read_file(path):
+    size = path.stat().st_size
+    with path.open("rb") as handle:
         if size <= 4_000_000:
             data = handle.read()
         else:
@@ -253,6 +254,20 @@ def read_log():
             handle.seek(size - 2_000_000)
             data = head + b"\n" + handle.read()
     return data.decode("utf-8", "replace")
+
+
+def read_log():
+    if not LOG.exists():
+        return ""
+    return read_file(LOG)
+
+
+def newest_backup():
+    folder = LOG.parent
+    if not folder.exists():
+        return None
+    backups = sorted(folder.glob("RSDragonwilds-backup-*.log"))
+    return backups[-1] if backups else None
 
 
 def last_match(pattern, text):
@@ -288,12 +303,84 @@ def log_facts(text, running, uptime_seconds, now=None):
     }
 
 
+def connection_facts(current_text, now):
+    accept = last_match(ACCEPT_RE, current_text)
+    close = last_match(CLOSE_RE, current_text)
+    before = False
+    if accept is None and close is None:
+        backup = newest_backup()
+        if backup is not None:
+            previous = read_file(backup)
+            accept = last_match(ACCEPT_RE, previous)
+            close = last_match(CLOSE_RE, previous)
+            before = accept is not None or close is not None
+    return {
+        "connection_before_this_start": before,
+        "last_accept": None
+        if accept is None
+        else {"age_seconds": age_seconds(accept.group(1), now), "address": accept.group(2)},
+        "last_close_age_seconds": None if close is None else age_seconds(close.group(1), now),
+    }
+
+
+def demux_logs(body):
+    if len(body) < 8 or body[1:4] != b"\x00\x00\x00":
+        return body.decode("utf-8", "replace")
+    parts = []
+    index = 0
+    while index + 8 <= len(body):
+        if body[index + 1:index + 4] != b"\x00\x00\x00":
+            parts.append(body[index:])
+            break
+        size = int.from_bytes(body[index + 4:index + 8], "big")
+        start = index + 8
+        end = start + size
+        if end > len(body):
+            parts.append(body[start:])
+            break
+        parts.append(body[start:end])
+        index = end
+    return b"".join(parts).decode("utf-8", "replace")
+
+
+_update_cache = {"at": 0.0, "value": False}
+
+
+def steam_update_pending():
+    now = time.time()
+    if now - _update_cache["at"] < 60:
+        return _update_cache["value"]
+    pending = False
+    try:
+        since = int(now) - 45 * 60
+        status, body = docker_get(
+            f"/containers/{CONTAINER}/logs?stdout=1&stderr=1&since={since}"
+        )
+        if status == 200:
+            for line in demux_logs(body).splitlines():
+                if "New Steam version is available" in line and "stopping server" in line:
+                    pending = True
+                    break
+    except Exception:
+        pending = False
+    _update_cache["at"] = now
+    _update_cache["value"] = pending
+    return pending
+
+
 def snapshot():
     try:
         state = container_state()
     except Exception:
         state = {"running": False, "status": "unknown", "uptime_seconds": None}
-    facts = log_facts(read_log(), state["running"], state["uptime_seconds"])
+    now = datetime.now(timezone.utc)
+    text = read_log()
+    facts = log_facts(text, state["running"], state["uptime_seconds"], now)
+    facts.update(connection_facts(text, now))
+    try:
+        update_pending = steam_update_pending()
+    except Exception:
+        update_pending = False
     return {
         "name": ini_value("ServerName") or "Dragonwilds",
         "running": state["running"],
@@ -305,6 +392,8 @@ def snapshot():
         "save_stale": facts["save_stale"],
         "last_accept": facts["last_accept"],
         "last_close_age_seconds": facts["last_close_age_seconds"],
+        "connection_before_this_start": facts["connection_before_this_start"],
+        "update_pending": update_pending,
         "join_password": ini_value("WorldPassword"),
         "direct": DIRECT_HOST,
         "port": GAME_PORT,
