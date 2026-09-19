@@ -60,4 +60,6 @@ docker logs rsdw-dedicated 2>&1 | awk '/JoinCode/{line=$0} END{print line}'
 
 ## Record a session
 
-`watch-logs.py` polls the game log, container output, save-file sizes, and UDP ports every 30 seconds. It does not change the server. It skips profanity-filter lines. Set `RSDW_SSH_HOST`, `RSDW_LOG`, and `RSDW_SAV_DIR` before running it. Output stays in this directory and is gitignored.
+`watch-logs.py` polls every 30 seconds and does not change the server. Read `summary.md` for who is in, the last save, the invite code, and whether the UDP ports are listening. `events.log` has one line per join, leave, save, invite-code change, and the first time each error appears. `gamelog.log` keeps the raw log without profanity-filter lines.
+
+Set `RSDW_SSH_HOST`, `RSDW_LOG`, and `RSDW_SAV_DIR`. Optional `RSDW_RECORD_DIR` chooses the output folder. Output is gitignored.

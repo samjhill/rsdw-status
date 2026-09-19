@@ -9,3 +9,5 @@ gamelog.log
 docker.log
 status.jsonl
 resources.log
+summary.md
+state.json
