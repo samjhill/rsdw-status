@@ -9,6 +9,8 @@ import os
 import re
 import socket
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,9 +18,35 @@ from pathlib import Path
 CONTAINER = os.environ.get("RSDW_CONTAINER", "rsdw-dedicated")
 LOG = Path("/logs/RSDragonwilds.log")
 INI = Path("/config/DedicatedServer.ini")
+STEAMAPPS = Path(os.environ.get("RSDW_STEAMAPPS", "/steamapps"))
+STEAMAPPID = "4019830"
+MANIFEST = STEAMAPPS / f"appmanifest_{STEAMAPPID}.acf"
 PORT = int(os.environ.get("RSDW_STATUS_PORT", "8791"))
 DIRECT_HOST = os.environ.get("RSDW_DIRECT_HOST", "").strip()
 GAME_PORT = int(os.environ.get("RSDW_GAME_PORT", "7777"))
+BUILD_RE = re.compile(r'"buildid"\s+"(\d+)"')
+PLACE_NAMES = (
+    "Ashdale",
+    "Al Kharid",
+    "Ardougne",
+    "Burthorpe",
+    "Canifis",
+    "Catherby",
+    "Crandor",
+    "Draynor Village",
+    "Falador",
+    "Lumbridge",
+    "Miscellania",
+    "Port Sarim",
+    "Rimmington",
+    "Seers Village",
+    "Taverley",
+    "Varrock",
+    "Yanille",
+    "Zanaris",
+    "Prifddinas",
+    "Menaphos",
+)
 STAMP = r"\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}):\d{3}\]"
 SAVE_RE = re.compile(STAMP + r".*Save completed SUCCESSFULLY")
 READY_RE = re.compile(STAMP + r'.*ReadyToJoin"\] written with key\[[^\]]+\] value\[([01])\]')
@@ -35,13 +63,15 @@ CHEST_OPEN_RE = re.compile(STAMP + r'.*OnChestOpened_ServerOnly\(\) : Chest "([^
 CHEST_TIMER_RE = re.compile(
     STAMP + r'.*SetRespawnTimer\(\) : Chest "([^"]+)" set to respawn \+(\d+)\.(\d{2}):(\d{2}):(\d{2})'
 )
-STATION_RE = re.compile(STAMP + r".*Station (BP_Station_[A-Za-z0-9_]+)")
+CRAFT_RE = re.compile(
+    STAMP + r".*LogCraftingStation:.*CraftRecipe\(\) : (BP_[A-Za-z0-9_]+)"
+)
 CONVO_RE = re.compile(STAMP + r".*ClientUpdateConversation:\s*(.+)$")
 SAVES = Path(os.environ.get("RSDW_SAVES", "/saves"))
 STALE_AFTER = 600
 ACTIVITY_LIMIT = 12
 TAIL_BYTES = 1_500_000
-STATION_GAP = 90
+CRAFT_GAP = 90
 PARTY_CAP = 6
 
 PAGE = """<!doctype html>
@@ -224,6 +254,13 @@ async function refresh() {
     factsEl.replaceChildren();
     if (up && data.ready_to_join === false) addFact("Not ready to join yet.", true);
     if (data.update_pending) addFact("A Steam update will restart the server.", true);
+    if (data.build && data.build.installed) {
+      if (data.build.up_to_date === false && data.build.required) {
+        addFact("Server build " + data.build.installed + " is behind. Clients need " + data.build.required + ".", true);
+      } else {
+        addFact("Server build " + data.build.installed + ".", false);
+      }
+    }
     if (data.save_age_seconds == null) {
       addFact("No successful save in the recent log.", !!(up && data.save_stale));
     } else {
@@ -246,11 +283,7 @@ async function refresh() {
       return player.name + platform + since;
     });
     if (!partyRows.length) {
-      if (!data.connection_before_this_start && data.last_close_age_seconds == null && !data.last_leave) {
-        fillList(partyWrap, partyEl, ["Nobody is in."]);
-      } else {
-        fillList(partyWrap, partyEl, ["Nobody is in."]);
-      }
+      fillList(partyWrap, partyEl, [data.empty_flavor || "Nobody is in."]);
     } else {
       fillList(partyWrap, partyEl, partyRows);
     }
@@ -258,7 +291,9 @@ async function refresh() {
     fillList(chestsWrap, chestsEl, chestRows);
     const feedRows = (data.activity || []).map(item => ago(item.age_seconds) + " · " + item.text);
     fillList(feedWrap, feedEl, feedRows);
-    const bits = [joinPassword ? "Join password is " + joinPassword + "." : "No join password."];
+    const bits = [];
+    if (data.created_by) bits.push("Created by " + data.created_by + ".");
+    bits.push(joinPassword ? "Join password is " + joinPassword + "." : "No join password.");
     if (!up && code) bits.unshift("That code is from the last run. It changes when the server starts.");
     if (data.direct) bits.push("Direct connect " + data.direct + ", UDP " + data.port + ".");
     metaEl.className = "meta";
@@ -394,11 +429,13 @@ def human_chest_name(raw):
     return name or "Chest"
 
 
-def human_station_name(raw):
+def human_craft_name(raw):
     name = re.sub(r"_C(_\d+)?$", "", raw)
+    name = re.sub(r"^BP_Crafting_", "", name)
     name = re.sub(r"^BP_Station_", "", name)
+    name = re.sub(r"^BP_", "", name)
     name = name.replace("_", " ").strip()
-    return name or "Station"
+    return name or "Bench"
 
 
 def players_from_lines(lines, now=None):
@@ -499,7 +536,7 @@ def companion_from_tail(text, now=None):
     events = []
     chests = {}
     last_convo = None
-    last_station = {}
+    last_craft = {}
     name_by_id = {}
     for line in text.splitlines():
         if "Login request:" in line:
@@ -545,15 +582,15 @@ def companion_from_tail(text, now=None):
             entry["ready_at"] = ready_at
             chests[raw] = entry
             continue
-        station = STATION_RE.search(line)
-        if station:
-            stamp, raw = station.group(1), station.group(2)
-            kind = human_station_name(raw)
+        craft = CRAFT_RE.search(line)
+        if craft:
+            stamp, raw = craft.group(1), craft.group(2)
+            kind = human_craft_name(raw)
             when = log_stamp(stamp)
-            prev = last_station.get(kind)
-            if prev is None or (when - prev).total_seconds() >= STATION_GAP:
-                events.append((stamp, f"{kind} in use"))
-                last_station[kind] = when
+            prev = last_craft.get(kind)
+            if prev is None or (when - prev).total_seconds() >= CRAFT_GAP:
+                events.append((stamp, f"{kind} crafted"))
+                last_craft[kind] = when
             continue
         convo = CONVO_RE.search(line)
         if convo:
@@ -662,6 +699,7 @@ def demux_logs(body):
 
 
 _update_cache = {"at": 0.0, "value": False}
+_build_cache = {"at": 0.0, "value": None}
 
 
 def steam_update_pending():
@@ -684,6 +722,45 @@ def steam_update_pending():
     _update_cache["at"] = now
     _update_cache["value"] = pending
     return pending
+
+
+def installed_build_id():
+    if not MANIFEST.exists():
+        return None
+    match = BUILD_RE.search(MANIFEST.read_text(errors="replace"))
+    return match.group(1) if match else None
+
+
+def steam_build_status():
+    now = time.time()
+    if now - _build_cache["at"] < 60 and _build_cache["value"] is not None:
+        return _build_cache["value"]
+    installed = installed_build_id()
+    result = {"installed": installed, "required": None, "up_to_date": None}
+    if installed:
+        try:
+            query = urllib.parse.urlencode(
+                {"appid": STEAMAPPID, "version": installed, "format": "json"}
+            )
+            url = f"https://api.steampowered.com/ISteamApps/UpToDateCheck/v1/?{query}"
+            with urllib.request.urlopen(url, timeout=8) as response:
+                payload = json.load(response)
+            body = payload.get("response") or {}
+            if body.get("success") is True:
+                result["up_to_date"] = bool(body.get("up_to_date"))
+                required = body.get("required_version")
+                if required not in (None, ""):
+                    result["required"] = str(required)
+        except Exception:
+            pass
+    _build_cache["at"] = now
+    _build_cache["value"] = result
+    return result
+
+
+def empty_flavor():
+    place = PLACE_NAMES[int(time.time() // 3600) % len(PLACE_NAMES)]
+    return f"The party is empty. {place} waits."
 
 
 def current_save():
@@ -792,8 +869,15 @@ def snapshot():
         update_pending = steam_update_pending()
     except Exception:
         update_pending = False
+    try:
+        build = steam_build_status()
+    except Exception:
+        build = {"installed": None, "required": None, "up_to_date": None}
+    world = ini_value("DefaultWorldName") or ini_value("ServerName") or "Dragonwilds"
+    created_by = ini_value("ServerName") or ""
     return {
-        "name": ini_value("ServerName") or "Dragonwilds",
+        "name": world,
+        "created_by": created_by,
         "running": state["running"],
         "status": state["status"],
         "uptime_seconds": state["uptime_seconds"],
@@ -810,9 +894,11 @@ def snapshot():
         "last_leave": facts["last_leave"],
         "activity": facts["activity"],
         "chests": facts["chests"],
+        "empty_flavor": empty_flavor() if not facts["players"] else None,
         "last_close_age_seconds": facts["last_close_age_seconds"],
         "connection_before_this_start": facts["connection_before_this_start"],
         "update_pending": update_pending,
+        "build": build,
         "join_password": ini_value("WorldPassword"),
         "direct": DIRECT_HOST,
         "port": GAME_PORT,

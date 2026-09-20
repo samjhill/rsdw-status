@@ -27,12 +27,16 @@ Open [http://127.0.0.1:8791](http://127.0.0.1:8791).
 - The invite code, large, with a copy button. It is the latest `JoinCode` line in `RSDragonwilds.log`. A new code is written every time the game server starts. The copy button stays off until the log says the session is ready to join.
 - How long ago the world last saved. The dedicated server saves about every five minutes. If `SaveGames` is mounted, the page also shows the save-file size, and says if that size has not changed for 10 minutes. If the server is up and the last success is older than 10 minutes, the page says the save looks stale.
 - Who is in, each on their own line with platform and how long they have been in. A leave names the player when the log includes the same account id as the login.
-- A short activity feed: joins, leaves, saves, chest opens, crafting stations in use, and the latest shrine or NPC line from the log.
+- A short activity feed: joins, leaves, saves, chest opens, craft recipes, and the latest shrine or NPC line from the log. Station “clearing” lines on world load are ignored.
 - Chest respawn countdowns from `LogChests`, when the log has them. This is a list, not a map.
 - Memory and CPU for the game container. Network totals are omitted; on a host-network server Docker reports those as zero.
+- The page title is the world name from `DefaultWorldName` (what people search in the Worlds browser). The meta line shows `Created by` from `ServerName`.
+- The dedicated-server Steam build id from `steamapps/appmanifest_4019830.acf`, and a warning when Valve says that build is behind. Friends often cannot join when the client updated and the dedicated image has not.
 - A warning when the container log says a new Steam version is available and the server is stopping. That restart writes a new invite code.
 - The join password from `WorldPassword` in `DedicatedServer.ini`, with a copy button. If the world has no password, the button stays off.
-- The page title, from `ServerName` in that same file.
+- When nobody is in, a short flavor line named after a classic RuneScape place.
+
+It does **not** show which zone someone is standing in. The dedicated log has fog-of-war region unlocks (`LogMapRegions`), not a live zone feed — see [docs/live-zone.md](docs/live-zone.md). Hillwilds runs with `DEBUG=3` so we keep maximum logging on.
 
 Set `RSDW_DIRECT_HOST` if you also want a direct-connect address on the page. Leave it empty and that line is omitted.
 
@@ -55,7 +59,7 @@ The container mounts the Docker socket, so it can control Docker, not only read 
 | `RSDW_DIRECT_HOST` | empty | Direct-connect address. Hidden when empty. |
 | `RSDW_GAME_PORT` | `7777` | Game port shown next to that address |
 
-Compose mounts the game log at `/logs/RSDragonwilds.log`, the save files at `/saves`, and the ini at `/config/DedicatedServer.ini`. The save mount is optional. If it is missing, the page omits the file size.
+Compose mounts the game log at `/logs/RSDragonwilds.log`, the save files at `/saves`, the ini at `/config/DedicatedServer.ini`, and `steamapps` at `/steamapps` for the build id. The save and steamapps mounts are optional. If either is missing, the page omits that fact.
 
 ## Just the invite code
 

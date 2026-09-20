@@ -19,3 +19,4 @@ services:
       - ${RSDW_DATA_DIR}/RSDragonwilds/Saved/Logs:/logs:ro
       - ${RSDW_DATA_DIR}/RSDragonwilds/Saved/SaveGames:/saves:ro
       - ${RSDW_DATA_DIR}/RSDragonwilds/Saved/Config/LinuxServer:/config:ro
+      - ${RSDW_DATA_DIR}/steamapps:/steamapps:ro
