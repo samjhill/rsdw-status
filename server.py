@@ -25,14 +25,24 @@ READY_RE = re.compile(STAMP + r'.*ReadyToJoin"\] written with key\[[^\]]+\] valu
 ACCEPT_RE = re.compile(STAMP + r".*NotifyAcceptingConnection accepted from: (\S+)")
 CLOSE_RE = re.compile(STAMP + r".*ControlChannelClose")
 JOIN_RE = re.compile(STAMP + r'.*JoinCode"\] written with key\[[^\]]+\] value\[([A-Z0-9-]+)\]')
-JOINED_RE = re.compile(r"Join succeeded:\s*(\S+)")
+JOINED_RE = re.compile(STAMP + r".*Join succeeded:\s*(\S+)")
 LOGIN_NAME_RE = re.compile(r"Name=([^\s?]+)")
 LOGIN_PF_RE = re.compile(r"pf=([^?&\s]+)")
 USER_ID_RE = re.compile(r"userId:\s*(\S+)")
 UNIQUE_ID_RE = re.compile(r"UniqueId:\s*([^,\s]+)")
 CONN_CLOSE_RE = re.compile(STAMP + r".*UNetConnection::Close:")
+CHEST_OPEN_RE = re.compile(STAMP + r'.*OnChestOpened_ServerOnly\(\) : Chest "([^"]+)" opened')
+CHEST_TIMER_RE = re.compile(
+    STAMP + r'.*SetRespawnTimer\(\) : Chest "([^"]+)" set to respawn \+(\d+)\.(\d{2}):(\d{2}):(\d{2})'
+)
+STATION_RE = re.compile(STAMP + r".*Station (BP_Station_[A-Za-z0-9_]+)")
+CONVO_RE = re.compile(STAMP + r".*ClientUpdateConversation:\s*(.+)$")
 SAVES = Path(os.environ.get("RSDW_SAVES", "/saves"))
 STALE_AFTER = 600
+ACTIVITY_LIMIT = 12
+TAIL_BYTES = 1_500_000
+STATION_GAP = 90
+PARTY_CAP = 6
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -50,9 +60,10 @@ PAGE = """<!doctype html>
   main { width: min(26rem, calc(100% - 2rem)); padding: 1.5rem 0 2rem; }
   h1 { margin: 0; font-size: 0.85rem; letter-spacing: 0.14em; text-transform: uppercase; color: #6d645b; font-weight: 650; }
   .row { display: flex; align-items: center; gap: 0.55rem; margin-top: 0.85rem; font-size: 1.15rem; }
-  .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; background: #b7aea4; flex: none; }
+  .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; background: #b7aea4; flex: none; transition: transform 0.25s ease, box-shadow 0.25s ease; }
   .up .dot { background: #2c7a45; }
   .down .dot { background: #a33b32; }
+  .dot.flash { transform: scale(1.35); box-shadow: 0 0 0 4px rgba(44, 122, 69, 0.35); }
   .code {
     margin: 1.35rem 0 0.85rem; font-size: clamp(2.4rem, 12vw, 3.4rem);
     letter-spacing: 0.06em; font-weight: 680; font-variant-numeric: tabular-nums;
@@ -67,6 +78,13 @@ PAGE = """<!doctype html>
   .code.not-ready { opacity: 0.45; }
   .facts { margin: 1.4rem 0 0; padding: 0; list-style: none; color: #6d645b; line-height: 1.55; }
   .facts .warn { color: #a33b32; }
+  .section { margin: 1.15rem 0 0; }
+  .section h2 {
+    margin: 0 0 0.35rem; font-size: 0.72rem; letter-spacing: 0.12em;
+    text-transform: uppercase; color: #8a8076; font-weight: 650;
+  }
+  .section ul { margin: 0; padding: 0; list-style: none; color: #6d645b; line-height: 1.5; }
+  .section li + li { margin-top: 0.2rem; }
   .meta { margin-top: 1rem; color: #6d645b; line-height: 1.55; }
   .err { color: #a33b32; }
 </style>
@@ -74,13 +92,25 @@ PAGE = """<!doctype html>
 <body>
 <main>
   <h1 id="title">Dragonwilds</h1>
-  <div class="row" id="state"><span class="dot"></span><span id="label">Checking…</span></div>
+  <div class="row" id="state"><span class="dot" id="dot"></span><span id="label">Checking…</span></div>
   <div class="code" id="code">····-····</div>
   <div class="actions">
     <button id="copy" type="button" disabled>Copy invite code</button>
     <button id="copy-password" class="secondary" type="button" disabled>Copy password</button>
   </div>
   <ul class="facts" id="facts"></ul>
+  <div class="section" id="party-wrap" hidden>
+    <h2>Party</h2>
+    <ul id="party"></ul>
+  </div>
+  <div class="section" id="chests-wrap" hidden>
+    <h2>Chests</h2>
+    <ul id="chests"></ul>
+  </div>
+  <div class="section" id="feed-wrap" hidden>
+    <h2>Activity</h2>
+    <ul id="feed"></ul>
+  </div>
   <p class="meta" id="meta"></p>
 </main>
 <script>
@@ -88,12 +118,20 @@ const titleEl = document.getElementById("title");
 const codeEl = document.getElementById("code");
 const labelEl = document.getElementById("label");
 const stateEl = document.getElementById("state");
+const dotEl = document.getElementById("dot");
 const copyEl = document.getElementById("copy");
 const copyPasswordEl = document.getElementById("copy-password");
 const factsEl = document.getElementById("facts");
+const partyWrap = document.getElementById("party-wrap");
+const partyEl = document.getElementById("party");
+const chestsWrap = document.getElementById("chests-wrap");
+const chestsEl = document.getElementById("chests");
+const feedWrap = document.getElementById("feed-wrap");
+const feedEl = document.getElementById("feed");
 const metaEl = document.getElementById("meta");
 let code = "";
 let joinPassword = "";
+let lastPartyKey = "";
 
 function uptime(seconds) {
   if (seconds == null) return "";
@@ -110,11 +148,47 @@ function ago(seconds) {
   return uptime(seconds) + " ago";
 }
 
+function readyIn(seconds) {
+  if (seconds == null || seconds < 0) return "ready";
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d) return d + "d " + h + "h";
+  if (h) return h + "h " + m + "m";
+  if (m) return m + "m";
+  return "under a minute";
+}
+
 function addFact(text, warn) {
   const item = document.createElement("li");
   item.textContent = text;
   if (warn) item.className = "warn";
   factsEl.appendChild(item);
+}
+
+function fillList(wrap, list, rows) {
+  list.replaceChildren();
+  if (!rows || !rows.length) {
+    wrap.hidden = true;
+    return;
+  }
+  wrap.hidden = false;
+  for (const row of rows) {
+    const item = document.createElement("li");
+    item.textContent = row;
+    list.appendChild(item);
+  }
+}
+
+function partyKey(players) {
+  return (players || []).map(player => player.name).join("|");
+}
+
+function flashParty() {
+  dotEl.classList.remove("flash");
+  void dotEl.offsetWidth;
+  dotEl.classList.add("flash");
+  setTimeout(() => dotEl.classList.remove("flash"), 700);
 }
 
 async function refresh() {
@@ -124,7 +198,20 @@ async function refresh() {
     const up = data.running === true;
     const name = data.name || "Dragonwilds";
     titleEl.textContent = name;
-    document.title = name;
+    const players = data.players || [];
+    const key = partyKey(players);
+    if (lastPartyKey && key !== lastPartyKey) {
+      flashParty();
+      if (players.length > lastPartyKey.split("|").filter(Boolean).length) {
+        document.title = "● " + name;
+        setTimeout(() => { document.title = name; }, 2500);
+      } else {
+        document.title = name;
+      }
+    } else {
+      document.title = name;
+    }
+    lastPartyKey = key;
     stateEl.className = "row " + (up ? "up" : "down");
     labelEl.textContent = up ? "Up for " + uptime(data.uptime_seconds) : "Not running";
     code = data.invite_code || "";
@@ -146,21 +233,31 @@ async function refresh() {
     if (data.save_stale && data.save_age_seconds != null) addFact("The last save is more than 10 minutes old.", true);
     if (data.save_size_stale) addFact("Save file size has not changed for more than 10 minutes.", true);
     if (data.usage) addFact("Memory " + data.usage.memory + ", CPU " + data.usage.cpu + ".", false);
-    const prior = data.connection_before_this_start ? "before this start, " : "";
-    const players = data.players || [];
-    if (players.length) {
-      const names = players.map(player => player.platform ? player.name + " (" + player.platform + ")" : player.name);
-      let who = names[0];
-      if (names.length === 2) who = names[0] + " and " + names[1];
-      else if (names.length > 2) who = names.slice(0, -1).join(", ") + ", and " + names[names.length - 1];
-      addFact(who + (names.length === 1 ? " is in." : " are in."), false);
-    } else if (!data.connection_before_this_start && data.last_close_age_seconds == null) {
-      addFact("No connection has reached this server.", false);
-    } else {
-      addFact("Nobody is in.", false);
-    }
     if (data.unnamed_leave) addFact("Someone left, and the log did not say who.", false);
-    if (data.last_close_age_seconds != null) addFact("Last close " + prior + ago(data.last_close_age_seconds) + ".", false);
+    if (data.last_leave && data.last_leave.name) {
+      addFact(data.last_leave.name + " left " + ago(data.last_leave.age_seconds) + ".", false);
+    } else if (data.last_close_age_seconds != null && !players.length) {
+      const prior = data.connection_before_this_start ? "before this start, " : "";
+      addFact("Last close " + prior + ago(data.last_close_age_seconds) + ".", false);
+    }
+    const partyRows = players.map(player => {
+      const platform = player.platform ? " (" + player.platform + ")" : "";
+      const since = player.in_for_seconds != null ? ", in " + uptime(player.in_for_seconds) : "";
+      return player.name + platform + since;
+    });
+    if (!partyRows.length) {
+      if (!data.connection_before_this_start && data.last_close_age_seconds == null && !data.last_leave) {
+        fillList(partyWrap, partyEl, ["Nobody is in."]);
+      } else {
+        fillList(partyWrap, partyEl, ["Nobody is in."]);
+      }
+    } else {
+      fillList(partyWrap, partyEl, partyRows);
+    }
+    const chestRows = (data.chests || []).map(chest => chest.name + ", ready in " + readyIn(chest.ready_in_seconds));
+    fillList(chestsWrap, chestsEl, chestRows);
+    const feedRows = (data.activity || []).map(item => ago(item.age_seconds) + " · " + item.text);
+    fillList(feedWrap, feedEl, feedRows);
     const bits = [joinPassword ? "Join password is " + joinPassword + "." : "No join password."];
     if (!up && code) bits.unshift("That code is from the last run. It changes when the server starts.");
     if (data.direct) bits.push("Direct connect " + data.direct + ", UDP " + data.port + ".");
@@ -194,7 +291,7 @@ copyEl.addEventListener("click", () => copyText(code, copyEl, "Copy invite code"
 copyPasswordEl.addEventListener("click", () => copyText(joinPassword, copyPasswordEl, "Copy password"));
 
 refresh();
-setInterval(refresh, 8000);
+setInterval(refresh, 3500);
 </script>
 </body>
 </html>
@@ -284,16 +381,34 @@ def mark_left(players, user_id):
     for player in reversed(players):
         if not player["left"] and player["user_id"] == user_id:
             player["left"] = True
-            return True
-    return False
+            return player
+    return None
 
 
-def players_from_lines(lines):
+def human_chest_name(raw):
+    name = raw.split("_C_UAID_")[0]
+    name = re.sub(r"^BP_Dungeon_Treasure_Chest_BM_", "", name)
+    name = re.sub(r"^BP_Dungeon_Treasure_Chest_", "", name)
+    name = re.sub(r"^BP_", "", name)
+    name = name.replace("_", " ").strip()
+    return name or "Chest"
+
+
+def human_station_name(raw):
+    name = re.sub(r"_C(_\d+)?$", "", raw)
+    name = re.sub(r"^BP_Station_", "", name)
+    name = name.replace("_", " ").strip()
+    return name or "Station"
+
+
+def players_from_lines(lines, now=None):
+    now = now or datetime.now(timezone.utc)
     players = []
     platforms = {}
     ids = {}
     unnamed_leave = False
     last_close = None
+    last_leave = None
     named_close_at = set()
     for line in lines:
         if "Login request:" in line:
@@ -307,11 +422,12 @@ def players_from_lines(lines):
             continue
         joined = JOINED_RE.search(line)
         if joined:
-            name = joined.group(1)
+            stamp, name = joined.group(1), joined.group(2)
             players.append({
                 "name": name,
                 "platform": platforms.get(name) or "",
                 "user_id": ids.get(name) or "",
+                "joined_at": stamp,
                 "left": False,
             })
             continue
@@ -320,7 +436,11 @@ def players_from_lines(lines):
             last_close = named.group(1)
             named_close_at.add(last_close)
             user_id = UNIQUE_ID_RE.search(line)
-            if not (user_id and mark_left(players, user_id.group(1))):
+            left = mark_left(players, user_id.group(1)) if user_id else None
+            if left:
+                last_leave = {"name": left["name"], "at": last_close}
+                unnamed_leave = False
+            else:
                 unnamed_leave = True
             continue
         closed = CLOSE_RE.search(line)
@@ -332,17 +452,132 @@ def players_from_lines(lines):
         still_in = [player for player in players if not player["left"]]
         if len(still_in) == 1:
             still_in[0]["left"] = True
+            last_leave = {"name": still_in[0]["name"], "at": last_close}
+            unnamed_leave = False
         elif len(still_in) > 1:
             unnamed_leave = True
-    present = [{"name": player["name"], "platform": player["platform"]} for player in players if not player["left"]]
-    return present, unnamed_leave, last_close
+    present = []
+    for player in players:
+        if player["left"]:
+            continue
+        present.append({
+            "name": player["name"],
+            "platform": player["platform"],
+            "in_for_seconds": age_seconds(player["joined_at"], now) if player.get("joined_at") else None,
+        })
+        if len(present) >= PARTY_CAP:
+            break
+    leave = None
+    if last_leave:
+        leave = {
+            "name": last_leave["name"],
+            "age_seconds": age_seconds(last_leave["at"], now),
+        }
+    return present, unnamed_leave, last_close, leave
 
 
-def players_in_log(path):
+def players_in_log(path, now=None):
     if not path.exists():
-        return [], False, None
+        return [], False, None, None
     with path.open("r", errors="replace") as handle:
-        return players_from_lines(handle)
+        return players_from_lines(handle, now)
+
+
+def read_log_tail(path, nbytes=TAIL_BYTES):
+    if not path.exists():
+        return ""
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size <= nbytes:
+            return handle.read().decode("utf-8", "replace")
+        handle.seek(size - nbytes)
+        return handle.read().decode("utf-8", "replace")
+
+
+def companion_from_tail(text, now=None):
+    now = now or datetime.now(timezone.utc)
+    events = []
+    chests = {}
+    last_convo = None
+    last_station = {}
+    name_by_id = {}
+    for line in text.splitlines():
+        if "Login request:" in line:
+            name = LOGIN_NAME_RE.search(line)
+            user_id = USER_ID_RE.search(line)
+            if name and user_id:
+                name_by_id[user_id.group(1)] = name.group(1)
+            continue
+        joined = JOINED_RE.search(line)
+        if joined:
+            events.append((joined.group(1), f"{joined.group(2)} joined"))
+            continue
+        named = CONN_CLOSE_RE.search(line)
+        if named and "UniqueId:" in line:
+            user_id = UNIQUE_ID_RE.search(line)
+            who = name_by_id.get(user_id.group(1)) if user_id else None
+            events.append((named.group(1), f"{who} left" if who else "someone left"))
+            continue
+        save = SAVE_RE.search(line)
+        if save:
+            events.append((save.group(1), "World saved"))
+            continue
+        opened = CHEST_OPEN_RE.search(line)
+        if opened:
+            stamp, raw = opened.group(1), opened.group(2)
+            label = human_chest_name(raw)
+            chests[raw] = {"name": label, "ready_at": None}
+            events.append((stamp, f"{label} opened"))
+            continue
+        timer = CHEST_TIMER_RE.search(line)
+        if timer:
+            stamp, raw, days, hours, minutes, seconds = timer.groups()
+            remaining = (
+                int(days) * 86400
+                + int(hours) * 3600
+                + int(minutes) * 60
+                + int(seconds)
+            )
+            ready_at = log_stamp(stamp).timestamp() + remaining
+            label = human_chest_name(raw)
+            entry = chests.get(raw) or {"name": label, "ready_at": None}
+            entry["name"] = label
+            entry["ready_at"] = ready_at
+            chests[raw] = entry
+            continue
+        station = STATION_RE.search(line)
+        if station:
+            stamp, raw = station.group(1), station.group(2)
+            kind = human_station_name(raw)
+            when = log_stamp(stamp)
+            prev = last_station.get(kind)
+            if prev is None or (when - prev).total_seconds() >= STATION_GAP:
+                events.append((stamp, f"{kind} in use"))
+                last_station[kind] = when
+            continue
+        convo = CONVO_RE.search(line)
+        if convo:
+            stamp, text_body = convo.group(1), convo.group(2).strip()
+            if text_body and text_body != last_convo:
+                clipped = text_body if len(text_body) <= 120 else text_body[:117] + "…"
+                events.append((stamp, clipped))
+                last_convo = text_body
+    activity = []
+    for stamp, text_body in reversed(events):
+        activity.append({"age_seconds": age_seconds(stamp, now), "text": text_body})
+        if len(activity) >= ACTIVITY_LIMIT:
+            break
+    chest_rows = []
+    for entry in chests.values():
+        ready_at = entry.get("ready_at")
+        if ready_at is None:
+            continue
+        ready_in = int(ready_at - now.timestamp())
+        if ready_in <= 0:
+            continue
+        chest_rows.append({"name": entry["name"], "ready_in_seconds": ready_in})
+    chest_rows.sort(key=lambda row: row["ready_in_seconds"])
+    return activity, chest_rows
 
 
 def newest_backup():
@@ -539,11 +774,15 @@ def snapshot():
     text = read_log()
     facts = log_facts(text, state["running"], state["uptime_seconds"], now)
     facts.update(connection_facts(text, now))
-    present, unnamed_leave, last_close = players_in_log(LOG)
+    present, unnamed_leave, last_close, last_leave = players_in_log(LOG, now)
     facts["players"] = present
     facts["unnamed_leave"] = unnamed_leave
+    facts["last_leave"] = last_leave
     if last_close:
         facts["last_close_age_seconds"] = age_seconds(last_close, now)
+    activity, chests = companion_from_tail(read_log_tail(LOG), now)
+    facts["activity"] = activity
+    facts["chests"] = chests
     save_bytes, save_size_stale = save_file_facts(state["running"], now)
     try:
         usage = container_usage() if state["running"] else None
@@ -568,6 +807,9 @@ def snapshot():
         "last_accept": facts["last_accept"],
         "players": facts["players"],
         "unnamed_leave": facts["unnamed_leave"],
+        "last_leave": facts["last_leave"],
+        "activity": facts["activity"],
+        "chests": facts["chests"],
         "last_close_age_seconds": facts["last_close_age_seconds"],
         "connection_before_this_start": facts["connection_before_this_start"],
         "update_pending": update_pending,

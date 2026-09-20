@@ -26,7 +26,9 @@ Open [http://127.0.0.1:8791](http://127.0.0.1:8791).
 - A green or red dot, and how long the container has been up.
 - The invite code, large, with a copy button. It is the latest `JoinCode` line in `RSDragonwilds.log`. A new code is written every time the game server starts. The copy button stays off until the log says the session is ready to join.
 - How long ago the world last saved. The dedicated server saves about every five minutes. If `SaveGames` is mounted, the page also shows the save-file size, and says if that size has not changed for 10 minutes. If the server is up and the last success is older than 10 minutes, the page says the save looks stale.
-- Who is in, from `Join succeeded` lines, with the platform from the login line. A close names the player when the log includes the same account id as the login. If it does not, and more than one person was in, the page keeps them listed and says someone left without a name. It also shows how long ago the last close was. If this start has no close, the page uses the previous log and says that close was before this start.
+- Who is in, each on their own line with platform and how long they have been in. A leave names the player when the log includes the same account id as the login.
+- A short activity feed: joins, leaves, saves, chest opens, crafting stations in use, and the latest shrine or NPC line from the log.
+- Chest respawn countdowns from `LogChests`, when the log has them. This is a list, not a map.
 - Memory and CPU for the game container. Network totals are omitted; on a host-network server Docker reports those as zero.
 - A warning when the container log says a new Steam version is available and the server is stopping. That restart writes a new invite code.
 - The join password from `WorldPassword` in `DedicatedServer.ini`, with a copy button. If the world has no password, the button stays off.
