@@ -32,6 +32,7 @@ Open [http://127.0.0.1:8791](http://127.0.0.1:8791).
 - Memory and CPU for the game container. Network totals are omitted; on a host-network server Docker reports those as zero.
 - The page title is the world name from `DefaultWorldName` (what people search in the Worlds browser). The meta line shows `Created by` from `ServerName`.
 - The dedicated-server Steam build id from `steamapps/appmanifest_4019830.acf`, and a warning when Valve says that build is behind. Friends often cannot join when the client updated and the dedicated image has not.
+- A red warning when a client connects with a different network version than the server (`invalid version` in the log). After five minutes the page restarts the game container so SteamCMD can pull the new build. The invite code changes on that restart. Restarts are limited to once every 30 minutes.
 - A warning when the container log says a new Steam version is available and the server is stopping. That restart writes a new invite code.
 - The join password from `WorldPassword` in `DedicatedServer.ini`, with a copy button. If the world has no password, the button stays off.
 - When nobody is in, a short flavor line named after a classic RuneScape place.

@@ -67,12 +67,29 @@ CRAFT_RE = re.compile(
     STAMP + r".*LogCraftingStation:.*CraftRecipe\(\) : (BP_[A-Za-z0-9_]+)"
 )
 CONVO_RE = re.compile(STAMP + r".*ClientUpdateConversation:\s*(.+)$")
+INVALID_VERSION_RE = re.compile(
+    STAMP
+    + r".*connecting with invalid version\..*LocalNetworkVersion:\s*(\d+),\s*RemoteNetworkVersion:\s*(\d+)"
+)
+COMPAT_VERSION_RE = re.compile(
+    STAMP
+    + r".*IsNetworkCompatibleOverride:\s*LocalVersion\s*=\s*(\d+),\s*RemoteVersion\s*=\s*(\d+)"
+)
 SAVES = Path(os.environ.get("RSDW_SAVES", "/saves"))
 STALE_AFTER = 600
 ACTIVITY_LIMIT = 12
 TAIL_BYTES = 1_500_000
 CRAFT_GAP = 90
 PARTY_CAP = 6
+MISMATCH_GRACE = 300
+MISMATCH_RESTART_COOLDOWN = 1800
+_mismatch_latch = {
+    "stamp": None,
+    "local": None,
+    "remote": None,
+    "first_seen": None,
+}
+_last_mismatch_restart_at = 0.0
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -253,6 +270,14 @@ async function refresh() {
     copyPasswordEl.textContent = joinPassword ? "Copy password" : "No password";
     factsEl.replaceChildren();
     if (up && data.ready_to_join === false) addFact("Not ready to join yet.", true);
+    if (data.version_mismatch) {
+      const vm = data.version_mismatch;
+      let msg = "Version mismatch: server " + vm.local + ", client " + vm.remote + ".";
+      if (vm.restarting) msg += " Restarting now. Invite code will change.";
+      else if (vm.restart_in_seconds > 0) msg += " Restarting in " + Math.ceil(vm.restart_in_seconds / 60) + "m. Invite code will change.";
+      else msg += " Restart pending.";
+      addFact(msg, true);
+    }
     if (data.update_pending) addFact("A Steam update will restart the server.", true);
     if (data.build && data.build.installed) {
       if (data.build.up_to_date === false && data.build.required) {
@@ -353,6 +378,32 @@ def docker_get(path, timeout=3):
     return status, body
 
 
+def docker_post(path, timeout=30):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect("/var/run/docker.sock")
+        sock.sendall(
+            f"POST {path} HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n".encode()
+        )
+        chunks = []
+        while True:
+            data = sock.recv(65536)
+            if not data:
+                break
+            chunks.append(data)
+    finally:
+        sock.close()
+    raw = b"".join(chunks)
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status = int(head.split(b" ", 2)[1])
+    return status, body
+
+
+def restart_game_container():
+    return docker_post(f"/containers/{CONTAINER}/restart?t=20")
+
+
 def ini_value(key):
     if not INI.exists():
         return ""
@@ -366,23 +417,35 @@ def ini_value(key):
 def container_state():
     status, body = docker_get(f"/containers/{CONTAINER}/json")
     if status != 200:
-        return {"running": False, "status": "missing", "uptime_seconds": None}
+        return {
+            "running": False,
+            "status": "missing",
+            "uptime_seconds": None,
+            "started_at": None,
+        }
     info = json.loads(body)
     state = info.get("State") or {}
     started = state.get("StartedAt") or ""
     uptime = None
-    if state.get("Running") and started:
+    started_at = None
+    if started:
         stamp = started.replace("Z", "+00:00")
         if "." in stamp:
             left, right = stamp.split(".", 1)
             frac, zone = right[:6], right[6:]
             zone = zone[zone.find("+") if "+" in zone else zone.find("-"):] or "+00:00"
             stamp = f"{left}.{frac}{zone}"
-        uptime = max(0, int((datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).total_seconds()))
+        try:
+            started_at = datetime.fromisoformat(stamp)
+        except ValueError:
+            started_at = None
+        if state.get("Running") and started_at is not None:
+            uptime = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
     return {
         "running": bool(state.get("Running")),
         "status": state.get("Status") or "unknown",
         "uptime_seconds": uptime,
+        "started_at": started_at,
     }
 
 
@@ -763,6 +826,88 @@ def empty_flavor():
     return f"The party is empty. {place} waits."
 
 
+def clear_mismatch_latch():
+    _mismatch_latch["stamp"] = None
+    _mismatch_latch["local"] = None
+    _mismatch_latch["remote"] = None
+    _mismatch_latch["first_seen"] = None
+
+
+def version_mismatch_from_log(text, started_at, now=None):
+    """Latch the first network-version mismatch after the current container start."""
+    global _last_mismatch_restart_at
+    now = now or datetime.now(timezone.utc)
+    if _mismatch_latch["first_seen"] is not None and started_at is not None:
+        if started_at > _mismatch_latch["first_seen"]:
+            clear_mismatch_latch()
+
+    latest_mismatch = None
+    latest_ok = None
+    for line in text.splitlines():
+        bad = INVALID_VERSION_RE.search(line)
+        if bad:
+            stamp, local, remote = bad.group(1), bad.group(2), bad.group(3)
+            if local != remote:
+                latest_mismatch = (stamp, local, remote)
+            continue
+        compat = COMPAT_VERSION_RE.search(line)
+        if compat:
+            stamp, local, remote = compat.group(1), compat.group(2), compat.group(3)
+            if local != remote:
+                latest_mismatch = (stamp, local, remote)
+            else:
+                latest_ok = (stamp, local, remote)
+
+    if latest_mismatch is None:
+        if latest_ok is not None and _mismatch_latch["first_seen"] is not None:
+            # Compatible join after mismatch and no newer invalid line: clear.
+            ok_at = log_stamp(latest_ok[0])
+            if ok_at >= _mismatch_latch["first_seen"]:
+                clear_mismatch_latch()
+        return None
+
+    stamp, local, remote = latest_mismatch
+    seen_at = log_stamp(stamp)
+    if started_at is not None and seen_at < started_at:
+        # Stale line from before this container start.
+        return None
+
+    if _mismatch_latch["first_seen"] is None:
+        _mismatch_latch["stamp"] = stamp
+        _mismatch_latch["local"] = local
+        _mismatch_latch["remote"] = remote
+        _mismatch_latch["first_seen"] = seen_at
+    elif (
+        _mismatch_latch["local"] != local
+        or _mismatch_latch["remote"] != remote
+    ):
+        _mismatch_latch["stamp"] = stamp
+        _mismatch_latch["local"] = local
+        _mismatch_latch["remote"] = remote
+        # Keep first_seen for grace countdown continuity.
+
+    first_seen = _mismatch_latch["first_seen"]
+    age = max(0, int((now - first_seen).total_seconds()))
+    remaining = max(0, MISMATCH_GRACE - age)
+    restarting = False
+    if remaining == 0 and (time.time() - _last_mismatch_restart_at) >= MISMATCH_RESTART_COOLDOWN:
+        try:
+            status, _body = restart_game_container()
+            if status in (204, 200):
+                _last_mismatch_restart_at = time.time()
+                restarting = True
+        except Exception:
+            restarting = False
+
+    return {
+        "local": _mismatch_latch["local"],
+        "remote": _mismatch_latch["remote"],
+        "age_seconds": age,
+        "restart_in_seconds": remaining,
+        "restarting": restarting,
+    }
+
+
 def current_save():
     if not SAVES.is_dir():
         return None
@@ -846,7 +991,12 @@ def snapshot():
     try:
         state = container_state()
     except Exception:
-        state = {"running": False, "status": "unknown", "uptime_seconds": None}
+        state = {
+            "running": False,
+            "status": "unknown",
+            "uptime_seconds": None,
+            "started_at": None,
+        }
     now = datetime.now(timezone.utc)
     text = read_log()
     facts = log_facts(text, state["running"], state["uptime_seconds"], now)
@@ -873,6 +1023,12 @@ def snapshot():
         build = steam_build_status()
     except Exception:
         build = {"installed": None, "required": None, "up_to_date": None}
+    try:
+        version_mismatch = version_mismatch_from_log(
+            text, state.get("started_at"), now
+        )
+    except Exception:
+        version_mismatch = None
     world = ini_value("DefaultWorldName") or ini_value("ServerName") or "Dragonwilds"
     created_by = ini_value("ServerName") or ""
     return {
@@ -899,6 +1055,7 @@ def snapshot():
         "connection_before_this_start": facts["connection_before_this_start"],
         "update_pending": update_pending,
         "build": build,
+        "version_mismatch": version_mismatch,
         "join_password": ini_value("WorldPassword"),
         "direct": DIRECT_HOST,
         "port": GAME_PORT,
